@@ -2,8 +2,7 @@
 pandas
 numpy
 matplotlib
-pypdf
-PyPDF2
+pypdf            # or PyPDF2, but not both
 python-dotenv
 fastapi
 uvicorn
@@ -11,10 +10,10 @@ langchain
 langchain-groq
 openai
 pdfminer.six
-pypdf
-fitz
 PyMuPDF
 streamlit
 pydantic>=2.0
 python-multipart
 boto3
+flask
+requests         # corrected
