@@ -16,4 +16,5 @@ pydantic>=2.0
 python-multipart
 boto3
 flask
-requests         # corrected
+requests
+flask_cors      # corrected
