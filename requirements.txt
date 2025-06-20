@@ -1,0 +1,20 @@
+# Core libraries
+pandas
+numpy
+matplotlib
+pypdf
+PyPDF2
+python-dotenv
+fastapi
+uvicorn
+langchain
+langchain-groq
+openai
+pdfminer.six
+pypdf
+fitz
+PyMuPDF
+streamlit
+pydantic>=2.0
+python-multipart
+boto3

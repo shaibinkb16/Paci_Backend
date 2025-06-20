@@ -1,0 +1,35 @@
+# Node.js dependencies
+Frontend/node_modules/
+Frontend/.env
+Frontend/.env.local
+Frontend/.next/
+Frontend/dist/
+Frontend/build/
+Frontend/.cache/
+
+# Python dependencies and virtual environments
+Backend/venv/
+Backend/.env
+Backend/__pycache__/
+Backend/*.pyc
+Backend/.pytest_cache/
+Backend/.mypy_cache/
+
+# VS Code settings
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# S3 credentials or sensitive config (if any)
+*.pem
+*.key
+*.crt
+
+# Misc
+.env
+.env.*
