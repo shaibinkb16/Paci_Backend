@@ -1,9 +1,11 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
+import traceback
 from reconcile_logic import extract_expense_data, extract_statement_entries, reconcile_with_llm
 from s3_utils import list_s3_files, download_s3_file, upload_to_s3
 import json
+from reconcile_logic import reconcile_preview
 
 app = Flask(__name__)
 CORS(app)
@@ -16,39 +18,36 @@ S3_BUCKET = os.getenv("S3_BUCKET_NAME")
 @app.route('/api/reconcile', methods=['POST'])
 def reconcile_endpoint():
     try:
-        # Fetch and process expense PDFs from S3
-        all_expenses = []
-        expense_files = list_s3_files(S3_BUCKET, prefix=EXPENSE_PREFIX)
-        for key in expense_files:
-            if key.lower().endswith(".pdf"):
-                file_data = download_s3_file(S3_BUCKET, key)
-                if file_data:
-                    all_expenses.extend(extract_expense_data(file_data))
+        # Run the preview reconciliation (returns a dict with all results)
+        result = reconcile_preview()
 
-        # Fetch and process only 'saving' statement PDFs from S3
-        statement_files = list_s3_files(S3_BUCKET, prefix=STATEMENT_PREFIX)
-        saving_statement_files = [key for key in statement_files if "saving" in key.lower() and key.lower().endswith(".pdf")]
-        if not saving_statement_files:
-            return jsonify({"error": "No saving statement PDF found"}), 400
+        # Download both summaries from S3 (for redundancy, but also use result)
+        saving_summary = download_s3_file(S3_BUCKET, "reconciliation/saving_account_summary.txt")
+        current_summary = download_s3_file(S3_BUCKET, "reconciliation/current_account_summary.txt")
+        saving_summary = saving_summary.decode("utf-8") if saving_summary else ""
+        current_summary = current_summary.decode("utf-8") if current_summary else ""
 
-        all_statements = []
-        for key in saving_statement_files:
-            statement_data = download_s3_file(S3_BUCKET, key)
-            if statement_data:
-                all_statements.extend(extract_statement_entries(statement_data))
-
-        # Reconciliation
-        report_df, summary = reconcile_with_llm(all_expenses, all_statements)
+        # Also get the current account report data (Excel "matched" sheet)
+        current_report_bytes = download_s3_file(S3_BUCKET, "reconciliation/current_account.xlsx")
+        current_report = []
+        if current_report_bytes:
+            import pandas as pd
+            from io import BytesIO
+            df = pd.read_excel(BytesIO(current_report_bytes), sheet_name="matched")
+            current_report = df.to_dict(orient='records')
 
         return jsonify({
             "success": True,
-            "report": report_df.to_dict(orient='records'),
-            "summary": summary,
-            "expenses": all_expenses,
-            "statements": all_statements
+            "saving_summary": saving_summary,
+            "current_summary": current_summary,
+            "saving_metrics": result['savings_metrics'],
+            "current_metrics": result['current_metrics'],
+            "saving_report": result['df_matched_savings'].to_dict(orient='records'),
+            "current_report": current_report,
+            "expenses": result['all_expenses'],
+            "statements": result['all_savings_statements']
         })
     except Exception as e:
-        import traceback
         print(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 

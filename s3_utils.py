@@ -16,12 +16,11 @@ AWS_ACCESS_KEY = os.getenv("AWS_ACCESS_KEY_ID")
 AWS_SECRET_KEY = os.getenv("AWS_SECRET_ACCESS_KEY")
 AWS_REGION = os.getenv("AWS_REGION", "ap-south-1")  # Default to Mumbai
 
-# Initialize S3 client
 def get_s3_client():
+    """Initialize and return a boto3 S3 client using credentials from environment."""
     try:
         if not AWS_ACCESS_KEY or not AWS_SECRET_KEY:
             raise ValueError("AWS credentials missing in .env")
-        
         s3_client = boto3.client(
             "s3",
             region_name=AWS_REGION,
@@ -34,6 +33,14 @@ def get_s3_client():
         return None
 
 def upload_to_s3(file_data: bytes, bucket: str, s3_key: str, content_type: str = None) -> bool:
+    """
+    Upload a file to S3.
+    :param file_data: File content as bytes.
+    :param bucket: S3 bucket name.
+    :param s3_key: S3 object key (path in bucket).
+    :param content_type: MIME type (optional).
+    :return: True if upload succeeded, False otherwise.
+    """
     try:
         s3_client = get_s3_client()
         if not s3_client:
@@ -66,7 +73,12 @@ def upload_to_s3(file_data: bytes, bucket: str, s3_key: str, content_type: str =
         return False
 
 def list_s3_files(bucket: str, prefix: str = "") -> list:
-    """List all files in S3 under a given prefix"""
+    """
+    List all files in S3 under a given prefix.
+    :param bucket: S3 bucket name.
+    :param prefix: S3 prefix (folder path).
+    :return: List of S3 keys (file paths).
+    """
     s3_client = get_s3_client()
     if not s3_client:
         return []
@@ -80,6 +92,12 @@ def list_s3_files(bucket: str, prefix: str = "") -> list:
         return []
 
 def download_s3_file(bucket: str, key: str) -> bytes:
+    """
+    Download a file from S3.
+    :param bucket: S3 bucket name.
+    :param key: S3 object key (file path).
+    :return: File content as bytes, or None if not found/error.
+    """
     try:
         s3_client = get_s3_client()
         if not s3_client:
