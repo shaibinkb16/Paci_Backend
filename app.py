@@ -2,10 +2,10 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import os
 import traceback
-from reconcile_logic import extract_expense_data, extract_statement_entries, reconcile_with_llm
+from reconcile_logic1 import extract_expense_data, extract_statement_entries, reconcile_with_llm
 from s3_utils import list_s3_files, download_s3_file, upload_to_s3
 import json
-from reconcile_logic import reconcile_preview
+from reconcile_logic1 import reconcile_preview
 
 app = Flask(__name__)
 CORS(app)
@@ -40,7 +40,7 @@ def reconcile_endpoint():
             "success": True,
             "saving_summary": saving_summary,
             "current_summary": current_summary,
-            "saving_metrics": result['savings_metrics'],
+            "saving_metrics": result['saving_metrics'],  # <-- fix here
             "current_metrics": result['current_metrics'],
             "saving_report": result['df_matched_savings'].to_dict(orient='records'),
             "current_report": current_report,

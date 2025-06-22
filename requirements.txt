@@ -19,3 +19,4 @@ flask
 requests
 flask_cors      # corrected
 openpyxl
+json5

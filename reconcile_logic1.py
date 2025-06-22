@@ -1,6 +1,7 @@
 import os
 import re
 import json
+import json5
 import pandas as pd
 from io import BytesIO
 from pypdf import PdfReader
@@ -452,125 +453,67 @@ def extract_current_account_entries_from_s3(key: str) -> List[Dict]:
         })
     return entries
 
-def reconcile_with_llm(expenses: List[Dict], statements: List[Dict]):
-    valid_expenses = [e for e in expenses if not e.get("parsing_failed")]
-    parsing_failed_expenses = [e for e in expenses if e.get("parsing_failed")]
-    valid_statements = [s for s in statements if not s.get("parsing_failed")]
+def pre_match_invoices_payments(
+    invoices: List[Dict], payments: List[Dict], date_window: int = 3
+) -> Tuple[List[Dict], List[Dict], List[Dict], set, set]:
+    from datetime import datetime, timedelta
 
-    if not valid_expenses or not valid_statements:
-        msg = "❌ Not enough valid data for LLM reconciliation."
-        upload_to_s3(msg.encode(), S3_BUCKET, "reconciliation/summary.txt", content_type="text/plain")
-        return pd.DataFrame(), msg
+    def extract_invoice_no(desc):
+        m = re.search(r'INV-[A-Z0-9-]+', desc)
+        return m.group(0) if m else None
 
-    parser = JsonOutputParser()
+    matched_pairs = []
+    matched_invoice_idxs = set()
+    matched_payment_idxs = set()
 
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", "You are a smart and strict finance assistant. Your job is to reconcile two lists of financial records by thinking step by step and returning only valid JSON. No markdown or commentary."),
-        ("user", """
-You are given two lists:
-1. `expenses`: extracted entries from employee-submitted expense bills.
-2. `statements`: bank statement transactions.
+    # Add tracking of already added matches
+    matched_desc_set = set()
+    
+    for i, inv in enumerate(invoices):
+        inv_no = extract_invoice_no(str(inv.get("description", "")))
+        inv_amt = float(inv.get("amount", 0))
+        inv_date = inv.get("date")
+        if isinstance(inv_date, str):
+            try:
+                inv_date = datetime.strptime(inv_date, "%Y-%m-%d").date()
+            except Exception:
+                try:
+                    inv_date = datetime.strptime(inv_date, "%Y/%m/%d").date()
+                except Exception:
+                    continue
+        for j, pay in enumerate(payments):
+            if j in matched_payment_idxs:
+                continue
+            pay_amt = float(pay.get("amount", 0))
+            pay_date = pay.get("date")
+            if isinstance(pay_date, str):
+                try:
+                    pay_date = datetime.strptime(pay_date, "%Y-%m-%d").date()
+                except Exception:
+                    try:
+                        pay_date = datetime.strptime(pay_date, "%Y/%m/%d").date()
+                    except Exception:
+                        continue
+            pay_desc = str(pay.get("description", ""))
+            if abs(inv_amt - pay_amt) > 0.01:
+                continue
+            if inv_no and inv_no in pay_desc:
+                if abs((pay_date - inv_date).days) <= date_window:
+                    match_key = f"{pay.get('amount')}-{pay.get('date')}-{pay.get('description')}"
+                    if match_key not in matched_desc_set:  # Only add if not already added
+                        matched_pairs.append({
+                            "date": pay.get("date"),
+                            "amount": pay.get("amount"),
+                            "description": pay.get("description")
+                        })
+                        matched_desc_set.add(match_key)
+                        matched_invoice_idxs.add(i)
+                        matched_payment_idxs.add(j)
+                        break
 
-Reconcile them using these rules:
-- ✅ Match if `date` and `amount` are exact, and description is semantically similar.
-- 🔁 Mark identical entries (same `date`, `amount`, `description`) beyond the first as `duplicates`.
-- ❌ Do NOT include duplicates in `matched` or `unmatched`.
-- 🟢 Statement entries with negative amounts are reimbursements.
-
-Return only valid JSON in this format:
-{
-  "summary": "...",
-  "matched": [...],
-  "unmatched_expenses": [...],
-  "unmatched_charges": [...],
-  "reimbursements": [...],
-  "duplicates": {
-    "expenses": [...],
-    "statements": [...]
-  }
-}
-
-Expense Entries:
-{expenses}
-
-Statement Entries:
-{statements}
-""")
-    ])
-
-    chain = prompt | ChatGroq(model="llama3-8b-8192", api_key=GROQ_API_KEY, temperature=0.0) | parser
-
-    try:
-        response = chain.invoke({"expenses": valid_expenses, "statements": valid_statements})
-    except Exception:
-        try:
-            fallback_chain = prompt | ChatGroq(model="llama3-8b-8192", api_key=GROQ_API_KEY) | StrOutputParser()
-            raw_output = fallback_chain.invoke({"expenses": valid_expenses, "statements": valid_statements})
-            json_str = raw_output[raw_output.find('{'): raw_output.rfind('}') + 1]
-            json_str = json_str.replace("'", '"')
-            json_str = re.sub(r",(\s*[\]}])", r"\1", json_str)
-            response = json.loads(json_str)
-        except Exception as fallback_error:
-            error_text = f"❌ LLM reconciliation failed: {fallback_error}"
-            upload_to_s3(error_text.encode(), S3_BUCKET, "reconciliation/summary.txt", content_type="text/plain")
-            return pd.DataFrame(), error_text
-
-    for e in parsing_failed_expenses:
-        response.setdefault("unmatched_expenses", []).append({
-            "date": "UNKNOWN DATE",
-            "amount": e.get("amount", "N/A"),
-            "description": f"{e.get('description', 'N/A')} (parsing failed)"
-        })
-
-    # Remove duplicates from unmatched
-    unmatched_expenses = response.get("unmatched_expenses", [])
-    duplicate_expenses = response.get("duplicates", {}).get("expenses", [])
-    cleaned_unmatched = [e for e in unmatched_expenses if e not in duplicate_expenses]
-    response["unmatched_expenses"] = cleaned_unmatched
-
-    summary_lines = []
-
-    def log_section(title, entries):
-        if entries:
-            summary_lines.append(title)
-            for e in entries:
-                amount = e.get("amount", "N/A")
-                date = e.get("date", "N/A")
-                desc = e.get("description", "N/A")
-                summary_lines.append(f"  • ₹{amount} on {date} - {desc}")
-            summary_lines.append("")
-
-    log_section("✅ Matched:", response.get("matched", []))
-    log_section("❌ Unmatched Expenses:", response.get("unmatched_expenses", []))
-    log_section("❌ Unmatched Charges:", response.get("unmatched_charges", []))
-    log_section("🟢 Reimbursements:", response.get("reimbursements", []))
-    log_section("🔁 Duplicates in Expenses:", response.get("duplicates", {}).get("expenses", []))
-    log_section("🔁 Duplicates in Statements:", response.get("duplicates", {}).get("statements", []))
-
-    summary_lines.append("=== Totals ===")
-    summary_lines.append(f"✅ Total Matched: {len(response.get('matched', []))}")
-    summary_lines.append(f"❌ Total Unmatched Expenses: {len(response.get('unmatched_expenses', []))}")
-    summary_lines.append(f"❌ Total Unmatched Charges: {len(response.get('unmatched_charges', []))}")
-    summary_lines.append(f"🟢 Total Reimbursements: {len(response.get('reimbursements', []))}")
-    summary_lines.append(f"🔁 Total Duplicate Expenses: {len(response.get('duplicates', {}).get('expenses', []))}")
-    summary_lines.append(f"🔁 Total Duplicate Statements: {len(response.get('duplicates', {}).get('statements', []))}")
-
-    summary_text = "\n".join(summary_lines)
-    upload_to_s3(summary_text.encode("utf-8"), S3_BUCKET, "reconciliation/summary.txt", content_type="text/plain")
-
-    # Save Excel output
-    with pd.ExcelWriter("llm_reconciliation_output.xlsx") as writer:
-        for section in ["matched", "unmatched_expenses", "unmatched_charges", "reimbursements"]:
-            pd.DataFrame(response.get(section, [])).to_excel(writer, sheet_name=section, index=False)
-        for key, val in response.get("duplicates", {}).items():
-            pd.DataFrame(val).to_excel(writer, sheet_name=f"duplicates_{key}", index=False)
-
-    with open("llm_reconciliation_output.xlsx", "rb") as f:
-        upload_to_s3(f.read(), S3_BUCKET, "reconciliation/llm_reconciliation_output.xlsx",
-                     content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-
-    return pd.DataFrame(response.get("matched", [])), summary_text
-
+    unmatched_invoices = [inv for idx, inv in enumerate(invoices) if idx not in matched_invoice_idxs]
+    unmatched_payments = [pay for idx, pay in enumerate(payments) if idx not in matched_payment_idxs]
+    return matched_pairs, unmatched_invoices, unmatched_payments, matched_invoice_idxs, matched_payment_idxs
 
 def reconcile_invoices_with_llm(invoices: List[Dict], current_statements: List[Dict]) -> Tuple[pd.DataFrame, str, dict]:
     from langchain_core.prompts import ChatPromptTemplate
@@ -579,17 +522,28 @@ def reconcile_invoices_with_llm(invoices: List[Dict], current_statements: List[D
     valid_invoices = [i for i in invoices if not i.get("parsing_failed")]
     valid_statements = [s for s in current_statements if not s.get("parsing_failed")]
 
-    if not valid_invoices or not valid_statements:
-        msg = "❌ Not enough valid data for LLM invoice reconciliation."
-        upload_to_s3(msg.encode(), S3_BUCKET, "reconciliation/summary.txt", content_type="text/plain")
-        return pd.DataFrame(), msg, {}
+    # --- PRE-MATCH LOGIC ---
+    pre_matched, unmatched_invoices, unmatched_payments, matched_invoice_idxs, matched_payment_idxs = pre_match_invoices_payments(valid_invoices, valid_statements, date_window=3)
 
-    parser = JsonOutputParser()
-
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", """
+    # If all invoices are pre-matched, skip LLM call and construct response directly
+    if len(pre_matched) == len(valid_invoices) or not unmatched_invoices:
+        response = {
+            "summary": f"All {len(pre_matched)} invoices successfully matched with current account entries.",
+            "invoices": valid_invoices,
+            "current_account_entries": valid_statements,
+            "matched": pre_matched,
+            "matched_invoices": [valid_invoices[i] for i in matched_invoice_idxs],
+            "unmatched_invoices": [],
+            "unmatched_payments": unmatched_payments,
+            "reimbursements": [],
+            "duplicates": {"invoices": [], "statements": []}
+        }
+    else:
+        # Continue with LLM reconciliation for unmatched items
+        parser = JsonOutputParser()
+        prompt = ChatPromptTemplate.from_messages([
+            ("system", """
 You are a strict, detail-oriented financial assistant trained to reconcile merchant invoices with credit merchant settlement entries (from a current account).
-Always output strict JSON. No markdown, no explanations.
 
 ==========================
 🧠 CHAIN-OF-THOUGHT LOGIC:
@@ -639,44 +593,11 @@ Step 7️⃣: Return a final JSON result with all sections described below.
     "invoices": [...],
     "statements": [...]
   }}
-}}"""),
-
-        ("user", """
-You are given two lists:
-1. `invoices`: system-generated invoice entries.
-2. `payments`: credit entries from the current account.
-
-Your task is to reconcile invoice payments using this logic:
-- ✅ Match if `amount` is the same and `description` semantically links invoice number or vendor.
-- 🗕️ Dates may differ by up to 3 days.
-- 🔁 Detect and separate duplicates (same invoice repeated).
-- ❌ Do NOT count duplicates in `matched`.
-- 🟢 Statement entries with no corresponding invoice may be reimbursements.
-
-Always return valid JSON in this format:
-{{
-  "summary": "...",
-  "matched": [...],
-  "unmatched_invoices": [...],
-  "unmatched_payments": [...],
-  "reimbursements": [...],
-  "duplicates": {{
-    "invoices": [...],
-    "statements": [...]
-  }}
 }}
+}}
+"""),
 
-Example:
-Invoices:
-[
-  {{ "date": "2025-06-20", "amount": 27033.29, "description": "Invoice INV-20250620-996A7766" }}
-]
-Payments:
-[
-  {{ "date": "2025-06-22", "amount": 27033.29, "description": "ACH Payment - Omkar Mestry", "type": "credit" }}
-]"""),
-
-        ("user", """
+            ("user", """
 Few-shot Example:
 
 Invoices:
@@ -690,9 +611,10 @@ Current Account Statements:
   {{ "date": "2025-06-20", "amount": 27033.29, "description": "Merchant Settlement INV-20250620-996A7766", "type": "credit" }},
   {{ "date": "2025-06-23", "amount": 1000.00, "description": "Refund to Merchant", "type": "credit" }},
   {{ "date": "2025-06-23", "amount": 1000.00, "description": "Refund to Merchant", "type": "credit" }}
-]"""),
+]
+"""),
 
-        ("user", """
+            ("user", """
 Few-shot Example – Do NOT match if date does not match:
 
 Invoices:
@@ -707,55 +629,149 @@ Current Account Statements:
 
 Expected:
 - No match (because date differs)
-- Should appear under unmatched_invoices"""),
+- Should appear under unmatched_invoices
+"""),
 
-        ("user", """
+            ("user", """
 Now reconcile the following:
 
 Invoices:
 {invoices}
-
+         
 Payments:
 {payments}
 
 Current Account Statements:
-{statements}
+{{statements}}
 """)
-    ])
+        ])
 
-    chain = prompt | ChatGroq(model="llama3-8b-8192", api_key=GROQ_API_KEY) | parser
-
-    try:
-        response = chain.invoke({
-            "invoices": valid_invoices,
-            "payments": valid_statements,
-            "statements": valid_statements  # Added 'statements' as required by prompt
-        })
-    except Exception as e:
         try:
-            fallback_chain = prompt | ChatGroq(model="llama3-8b-8192", api_key=GROQ_API_KEY) | StrOutputParser()
-            raw_output = fallback_chain.invoke({
-                "invoices": valid_invoices,
-                "payments": valid_statements,
-                "statements": valid_statements
+            response = (
+                prompt
+                | ChatGroq(model="llama3-8b-8192", api_key=GROQ_API_KEY)
+                | parser
+            ).invoke({
+                "invoices": unmatched_invoices,
+                "payments": unmatched_payments
             })
-            json_str = raw_output[raw_output.find('{'): raw_output.rfind('}') + 1]
-            response = json.loads(json_str)
-        except Exception as fallback_error:
-            error_text = f"❌ Invoice LLM reconciliation failed: {fallback_error}"
-            upload_to_s3(error_text.encode(), S3_BUCKET, "reconciliation/summary.txt", content_type="text/plain")
-            return pd.DataFrame(), error_text, {}
+        except Exception as e:
+            try:
+                fallback_chain = prompt | ChatGroq(model="llama3-8b-8192", api_key=GROQ_API_KEY) | StrOutputParser()
+                raw_output = fallback_chain.invoke({"invoices": unmatched_invoices, "payments": unmatched_payments})
+                print("=== RAW LLM OUTPUT ===")
+                print(raw_output)
+                
+                # Improved JSON extraction - remove comments and find JSON object
+                json_text = re.sub(r'//.*', '', raw_output)  # Remove comments
+                json_match = re.search(r'\{.*?\}', json_text, re.DOTALL)
+                if not json_match:
+                    # Try to construct a valid JSON response
+                    default_response = {
+                        "summary": "Failed to parse LLM output, using fallback",
+                        "invoices": unmatched_invoices,
+                        "current_account_entries": unmatched_payments,
+                        "matched": [],
+                        "matched_invoices": [],
+                        "unmatched_invoices": unmatched_invoices,
+                        "unmatched_payments": unmatched_payments,
+                        "reimbursements": [],
+                        "duplicates": {
+                            "invoices": [],
+                            "statements": []
+                        }
+                    }
+                    return pd.DataFrame(), "Failed to extract valid JSON from LLM response", default_response
+                    
+                json_str = json_match.group(0)
+                
+                # Clean up common JSON issues
+                json_str = json_str.replace("'", '"')
+                json_str = re.sub(r',(\s*[\]}])', r'\1', json_str)  # Remove trailing commas
+                json_str = re.sub(r'\bNaN\b', 'null', json_str)     # Replace NaN with null
+                json_str = re.sub(r'\b(Infinity|-Infinity)\b', 'null', json_str)  # Replace Infinity with null
+                json_str = re.sub(r'\.(\s*[\]}])', r'\1', json_str) # Remove stray dots
+                
+                try:
+                    response = json.loads(json_str)
+                except Exception:
+                    try:
+                        import json5
+                        response = json5.loads(json_str)
+                    except Exception:
+                        # Fallback to default response if all parsing fails
+                        response = {
+                            "summary": "JSON parsing failed, using fallback",
+                            "invoices": unmatched_invoices,
+                            "current_account_entries": unmatched_payments,
+                            "matched": [],
+                            "unmatched_invoices": unmatched_invoices,
+                            "unmatched_payments": unmatched_payments,
+                            "reimbursements": [],
+                            "duplicates": {"invoices": [], "statements": []}
+                        }
+            except Exception as fallback_error:
+                error_text = f"❌ Invoice LLM reconciliation failed: {fallback_error}\nRAW OUTPUT:\n{raw_output}"
+                upload_to_s3(error_text.encode(), S3_BUCKET, "reconciliation/summary.txt", content_type="text/plain")
+                return pd.DataFrame(), error_text, {}
+
+    # Merge pre-matched and LLM-matched for final output
+    all_matched = pre_matched + response.get("matched", [])
+    response["matched"] = all_matched
+
+    # --- REMOVE matched invoices/payments from unmatched lists ---
+    def is_same_invoice(inv, matched):
+        return (
+            abs(float(inv.get("amount", 0)) - float(matched.get("amount", 0))) < 0.01
+            and str(inv.get("description", "")).strip() in str(matched.get("description", "")).strip()
+        ) or (
+            str(inv.get("description", "")).strip() == str(matched.get("description", "")).strip()
+        )
+
+    def is_same_payment(pay, matched):
+        return (
+            abs(float(pay.get("amount", 0)) - float(matched.get("amount", 0))) < 0.01
+            and str(pay.get("description", "")).strip() == str(matched.get("description", "")).strip()
+        )
+
+    matched_invoice_set = set()
+    for m in all_matched:
+        for inv in valid_invoices:
+            if is_same_invoice(inv, m):
+                matched_invoice_set.add(json.dumps(inv, sort_keys=True))
+    matched_payment_set = set()
+    for m in all_matched:
+        for pay in valid_statements:
+            if is_same_payment(pay, m):
+                matched_payment_set.add(json.dumps(pay, sort_keys=True))
+
+    response["unmatched_invoices"] = [
+        inv for inv in response.get("unmatched_invoices", [])
+        if json.dumps(inv, sort_keys=True) not in matched_invoice_set
+    ]
+    response["unmatched_payments"] = [
+        pay for pay in response.get("unmatched_payments", [])
+        if json.dumps(pay, sort_keys=True) not in matched_payment_set
+    ]
 
     summary_lines = []
-
     def log_section(title, entries):
         if entries:
+            # Use a set to track already printed items
+            seen_entries = set()
             summary_lines.append(title)
             for e in entries:
                 amount = e.get("amount", "N/A")
                 date = e.get("date", "N/A")
                 desc = e.get("description", "N/A")
-                summary_lines.append(f"  • ₹{amount} on {date} - {desc}")
+                
+                # Create a unique identifier for this entry
+                entry_key = f"{amount}-{date}-{desc}"
+                
+                # Only log it if we haven't seen it before
+                if entry_key not in seen_entries:
+                    summary_lines.append(f"  • ₹{amount} on {date} - {desc}")
+                    seen_entries.add(entry_key)
             summary_lines.append("")
 
     log_section("✅ Matched:", response.get("matched", []))
@@ -769,19 +785,17 @@ Current Account Statements:
     upload_to_s3(summary_text.encode("utf-8"), S3_BUCKET, "reconciliation/summary.txt", content_type="text/plain")
 
     with pd.ExcelWriter("llm_invoice_reconciliation.xlsx") as writer:
-        wrote_sheet = False
         for section in ["matched", "unmatched_invoices", "unmatched_payments", "reimbursements"]:
             df = pd.DataFrame(response.get(section, []))
-            if not df.empty:
-                df.to_excel(writer, sheet_name=section, index=False)
-                wrote_sheet = True
+            if df.empty:
+                # Write an empty DataFrame with a placeholder column
+                df = pd.DataFrame([{"info": "No data"}])
+            df.to_excel(writer, sheet_name=section, index=False)
         for key, val in response.get("duplicates", {}).items():
             df = pd.DataFrame(val)
-            if not df.empty:
-                df.to_excel(writer, sheet_name=f"duplicates_{key}", index=False)
-                wrote_sheet = True
-        if not wrote_sheet:
-            pd.DataFrame([{"info": "No data"}]).to_excel(writer, sheet_name="empty", index=False)
+            if df.empty:
+                df = pd.DataFrame([{"info": "No data"}])
+            df.to_excel(writer, sheet_name=f"duplicates_{key}", index=False)
 
     with open("llm_invoice_reconciliation.xlsx", "rb") as f:
         upload_to_s3(f.read(), S3_BUCKET, "reconciliation/llm_invoice_reconciliation.xlsx",
@@ -820,16 +834,21 @@ def reconcile_current_account() -> str:
     excel_key = "reconciliation/current_account.xlsx"
     out_stream = BytesIO()
     with pd.ExcelWriter(out_stream, engine="openpyxl", mode="w") as writer:
+        wrote_sheet = False
         def safe_write(sheet_name, data):
+            nonlocal wrote_sheet
             df = pd.DataFrame(data)
             if not df.empty:
                 df.to_excel(writer, sheet_name=sheet_name, index=False)
+                wrote_sheet = True
         safe_write("matched", response.get("matched", []))
         safe_write("unmatched_invoices", response.get("unmatched_invoices", []))
         safe_write("unmatched_payments", response.get("unmatched_payments", []))
         safe_write("reimbursements", response.get("reimbursements", []))
         safe_write("duplicates_invoices", response.get("duplicates", {}).get("invoices", []))
         safe_write("duplicates_statements", response.get("duplicates", {}).get("statements", []))
+        if not wrote_sheet:
+            pd.DataFrame([{"info": "No data"}]).to_excel(writer, sheet_name="empty", index=False)
     upload_to_s3(out_stream.getvalue(), S3_BUCKET, excel_key,
                  content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     print("✅ Uploaded to S3: reconciliation/current_account.xlsx")
@@ -866,7 +885,7 @@ def reconcile_preview():
     summary_current = reconcile_current_account()
 
     # --- Metrics Calculation Functions ---
-    def calculate_savings_metrics(summary_text, all_expenses):
+    def calculate_savings_metrics(summary_text):
         metrics = {
             'Total Expense Bills': 0,
             'Matched with Bank Statement': 0,
@@ -876,8 +895,9 @@ def reconcile_preview():
         if not summary_text:
             return metrics
         sections = {
-            '✅ Matched:': 'Matched with Bank Statement',
-            '❌ Unmatched Expenses:': 'Unmatched Expense Bills',
+            '✅ Matched Expense Bills:': 'Matched with Bank Statement',
+            '❌ Unmatched Expense Bills:': 'Unmatched Expense Bills',
+            '❌ Unmatched Debits:': 'Unmatched Bank Debits',  # <-- Fix: match the correct section title
             '❌ Unmatched Charges:': 'Unmatched Bank Debits'
         }
         current_section = None
@@ -888,8 +908,10 @@ def reconcile_preview():
             elif line.startswith('• ₹') or line.startswith('  • ₹'):
                 if current_section:
                     metrics[current_section] += 1
-        # Use the actual number of parsed expense entries
-        metrics['Total Expense Bills'] = len([e for e in all_expenses if not e.get("parsing_failed")])
+        metrics['Total Expense Bills'] = (
+            metrics['Matched with Bank Statement'] +
+            metrics['Unmatched Expense Bills']
+        )
         return metrics
 
     def calculate_current_metrics(summary_text):
@@ -921,7 +943,7 @@ def reconcile_preview():
         return metrics
 
     # Get the metrics
-    savings_metrics = calculate_savings_metrics(summary_savings, all_expenses)
+    saving_metrics = calculate_savings_metrics(summary_savings)
     current_metrics = calculate_current_metrics(summary_current)
 
     # Upload summaries
@@ -936,6 +958,221 @@ def reconcile_preview():
         'summary_current': summary_current,
         'all_expenses': all_expenses,
         'all_savings_statements': all_savings_statements,
-        'savings_metrics': savings_metrics,
+        'saving_metrics': saving_metrics,
         'current_metrics': current_metrics
     }
+
+def reconcile_with_llm(expenses: List[Dict], statements: List[Dict]):
+    import re
+    valid_expenses = [e for e in expenses if not e.get("parsing_failed")]
+    parsing_failed_expenses = [e for e in expenses if e.get("parsing_failed")]
+    valid_statements = [s for s in statements if not s.get("parsing_failed")]
+
+    if not valid_expenses or not valid_statements:
+        msg = "❌ Not enough valid data for LLM reconciliation."
+        upload_to_s3(msg.encode(), S3_BUCKET, "reconciliation/saving_account_summary.txt", content_type="text/plain")
+        return pd.DataFrame(), msg
+
+    parser = JsonOutputParser()
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", r"""
+You are a strict and detail-oriented finance assistant. Your task is to reconcile employee-submitted `expense_bills` against `saving_account_entries` from a bank statement.
+
+Your job is to:
+1. Identify all valid expense and saving account entries.
+2. Match them strictly (see rules below).
+3. Detect duplicates in each list.
+4. Classify unmatched expenses.
+
+📋 Return a JSON object with the following structure:
+{{ 
+  "expense_bills": [...],                     
+  "saving_account_entries": [...],            
+  "matched": [...],                           
+  "unmatched_expenses": [...], 
+  "unmatched_debits": [...],                 
+  "duplicates": {{                            
+    "expenses": [...],                        
+    "statements": [...]                       
+  }}                                          
+}}
+
+✅ Matching Rules:
+- Amount must match exactly.
+- Date must match exactly.
+- Description must match **exactly** (case-insensitive match, no semantic similarity).
+
+🔁 Duplicate Rules:
+- Any entry in the same list (expenses or statements) that has the same `date`, `amount`, and `description` as another is a duplicate (beyond the first instance).
+- Duplicates are not considered for matching or unmatched classification.
+
+❌ Unmatched Expense Bills:
+- Valid expenses that were not matched and are not marked as duplicates.
+
+🛑 Exclude negative (reimbursement) entries from all reconciliation logic.
+
+🚫 Respond with JSON only. No markdown, no explanation, no extra text.
+"""),
+        ("user", r"""
+Few-shot Example:
+
+Expense Entries:
+[
+  {{ "date": "2024-12-01", "amount": 100.0, "description": "Cab Fare to Airport" }},
+  {{ "date": "2024-12-01", "amount": 100.0, "description": "Cab Fare to Airport" }}
+]
+
+Saving Account Entries:
+[
+  {{ "date": "2024-12-01", "amount": 100.0, "description": "Cab Fare to Airport" }}
+]
+
+Expected Output:
+{{ 
+  "expense_bills": [
+    {{ "date": "2024-12-01", "amount": 100.0, "description": "Cab Fare to Airport" }},
+    {{ "date": "2024-12-01", "amount": 100.0, "description": "Cab Fare to Airport" }}
+  ],
+  "saving_account_entries": [
+    {{ "date": "2024-12-01", "amount": 100.0, "description": "Cab Fare to Airport" }}
+  ],
+  "matched": [
+    {{ "date": "2024-12-01", "amount": 100.0, "description": "Cab Fare to Airport" }}
+  ],
+ "unmatched_expenses": [],
+  "unmatched_debits": [
+    {{ "date": "2024-12-02", "amount": 200.0, "description": "ATM Withdrawal" }}
+  ],
+  
+  "duplicates": {{
+    "expenses": [
+      {{ "date": "2024-12-01", "amount": 100.0, "description": "Cab Fare to Airport" }}
+    ],
+    "statements": []
+  }}
+}}
+"""),
+        ("user", """
+Now reconcile the below:
+
+Expense Entries:
+{expenses}
+
+Saving Account Entries:
+{statements}
+""")
+    ])
+
+    chain = prompt | ChatGroq(model="llama3-8b-8192", api_key=GROQ_API_KEY, temperature=0.0) | parser
+
+    try:
+        response = chain.invoke({"expenses": valid_expenses, "statements": valid_statements})
+    except Exception as e:
+        try:
+            fallback_chain = prompt | ChatGroq(model="llama3-8b-8192", api_key=GROQ_API_KEY, temperature=0.0) | StrOutputParser()
+            raw_output = fallback_chain.invoke({"expenses": valid_expenses, "statements": valid_statements})
+            
+            # Remove comments and extract JSON
+            json_text = re.sub(r'//.*', '', raw_output)
+            json_match = re.search(r"\{.*\}", json_text, re.DOTALL)
+            if not json_match:
+                raise ValueError("Could not extract JSON from LLM response")
+                
+            json_str = json_match.group()
+            
+            # Clean up common JSON issues
+            json_str = json_str.replace("'", '"')
+            json_str = re.sub(r',(\s*[\]}])', r'\1', json_str)
+            json_str = re.sub(r'\bNaN\b', 'null', json_str)
+            json_str = re.sub(r'\b(Infinity|-Infinity)\b', 'null', json_str)
+            
+            try:
+                response = json.loads(json_str)
+            except Exception:
+                import json5
+                response = json5.loads(json_str)
+                
+        except Exception as fallback_error:
+            error_text = f"❌ LLM reconciliation failed: {fallback_error}"
+            upload_to_s3(error_text.encode(), S3_BUCKET, "reconciliation/saving_account_summary.txt", content_type="text/plain")
+            return pd.DataFrame(), error_text
+
+    # Add parsing failed as unmatched
+    for e in parsing_failed_expenses:
+        response.setdefault("unmatched_expenses", []).append({
+            "date": "UNKNOWN DATE",
+            "amount": e.get("amount", "N/A"),
+            "description": f"{e.get('description', 'N/A')} (parsing failed)"
+        })
+
+    # Remove duplicates from unmatched
+    unmatched_expenses = response.get("unmatched_expenses", [])
+    duplicates_expenses = response.get("duplicates", {}).get("expenses", [])
+    cleaned_unmatched = [e for e in unmatched_expenses if e not in duplicates_expenses]
+    response["unmatched_expenses"] = cleaned_unmatched
+
+    # --- Ensure response["matched"] is always a list ---
+    matched_from_llm = response.get("matched", [])
+    if not isinstance(matched_from_llm, list):
+        # If it's not a list (e.g., int or None), replace with empty list
+        matched_from_llm = []
+
+    # --- Handle unmatched_debits in summary ---
+    summary_lines = []
+    def log_section(title, entries):
+        if entries:
+            summary_lines.append(title)
+            for e in entries:
+                amount = e.get("amount", "N/A")
+                date = e.get("date", "N/A")
+                desc = e.get("description", "N/A")
+                summary_lines.append(f"  • ₹{amount} on {date} - {desc}")
+            summary_lines.append("")
+
+    expense_bills = response.get("expense_bills", [])
+    statement_entries = response.get("saving_account_entries", [])
+    matched = response.get("matched", [])
+    unmatched = response.get("unmatched_expenses", [])
+    unmatched_debits = response.get("unmatched_debits", [])
+    duplicates = response.get("duplicates", {})
+    duplicate_expenses = duplicates.get("expenses", [])
+    duplicate_statements = duplicates.get("statements", [])
+
+    log_section("🧾 All Expense Bills:", expense_bills)
+    log_section("🏦 All Saving Account Entries:", statement_entries)
+    log_section("✅ Matched Expense Bills:", matched)
+    log_section("❌ Unmatched Expense Bills:", unmatched)
+    log_section("❌ Unmatched Debits:", unmatched_debits)
+    log_section("🔁 Duplicate Expense Bills:", duplicate_expenses)
+    log_section("🔁 Duplicate Statement Entries:", duplicate_statements)
+
+    summary_lines.append("=== Totals ===")
+    summary_lines.append(f"🧾 Total Expense Bills: {len(expense_bills)}")
+    summary_lines.append(f"🏦 Total Saving Account Entries: {len(statement_entries)}")
+    summary_lines.append(f"✅ Total Matched Expenses: {len(matched)}")
+    summary_lines.append(f"❌ Total Unmatched Expenses: {len(unmatched)}")
+    summary_lines.append(f"❌ Total Unmatched Debits: {len(unmatched_debits)}")
+    summary_lines.append(f"🔁 Total Duplicate Expense Bills: {len(duplicate_expenses)}")
+    summary_lines.append(f"🔁 Total Duplicate Statement Entries: {len(duplicate_statements)}")
+
+    summary_text = "\n".join(summary_lines)
+
+    # Write Excel output properly indented inside the function
+    with pd.ExcelWriter("llm_reconciliation_output.xlsx") as writer:
+        for section in ["expense_bills", "saving_account_entries", "matched", "unmatched_expenses", "unmatched_debits"]:
+            df = pd.DataFrame(response.get(section, []))
+            if df.empty:
+                # Write an empty DataFrame with a placeholder column
+                df = pd.DataFrame([{"info": "No data"}])
+            df.to_excel(writer, sheet_name=section, index=False)
+        for key, val in response.get("duplicates", {}).items():
+            df = pd.DataFrame(val)
+            if df.empty:
+                df = pd.DataFrame([{"info": "No data"}])
+            df.to_excel(writer, sheet_name=f"duplicates_{key}", index=False)
+
+    with open("llm_reconciliation_output.xlsx", "rb") as f:
+        upload_to_s3(f.read(), S3_BUCKET, "reconciliation/llm_reconciliation_output.xlsx",
+                     content_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    
+    return pd.DataFrame(response.get("matched", [])), summary_text
