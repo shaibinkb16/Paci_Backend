@@ -1,11 +1,11 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 import os
 import traceback
-from reconcile_logic1 import extract_expense_data, extract_statement_entries, reconcile_with_llm
 from s3_utils import list_s3_files, download_s3_file, upload_to_s3
 import json
 from reconcile_logic1 import reconcile_preview
+from io import BytesIO
 
 app = Flask(__name__)
 CORS(app)
@@ -33,19 +33,40 @@ def reconcile_endpoint():
         if current_report_bytes:
             import pandas as pd
             from io import BytesIO
-            df = pd.read_excel(BytesIO(current_report_bytes), sheet_name="matched")
+            
+            # Safe Excel reading function to handle missing worksheets
+            def safe_read_excel(file_bytes, sheet_name, default_columns=None):
+                try:
+                    return pd.read_excel(BytesIO(file_bytes), sheet_name=sheet_name)
+                except ValueError as e:
+                    if "Worksheet named" in str(e) and "not found" in str(e):
+                        print(f"Warning: Worksheet '{sheet_name}' not found in Excel file")
+                        # Return empty DataFrame with appropriate columns
+                        if default_columns:
+                            return pd.DataFrame(columns=default_columns)
+                        return pd.DataFrame()
+                    else:
+                        raise
+            
+            # Use safe reading function instead of direct access
+            df = safe_read_excel(
+                current_report_bytes, 
+                "matched", 
+                ["date", "description", "amount", "balance", "type"]
+            )
             current_report = df.to_dict(orient='records')
 
         return jsonify({
             "success": True,
             "saving_summary": saving_summary,
             "current_summary": current_summary,
-            "saving_metrics": result['saving_metrics'],  # <-- fix here
+            "saving_metrics": result['saving_metrics'],
             "current_metrics": result['current_metrics'],
             "saving_report": result['df_matched_savings'].to_dict(orient='records'),
             "current_report": current_report,
             "expenses": result['all_expenses'],
-            "statements": result['all_savings_statements']
+            "statements": result['all_savings_statements'],
+            "excel_files": result.get('excel_files', {})
         })
     except Exception as e:
         print(traceback.format_exc())
@@ -87,7 +108,7 @@ def upload_file():
         prefix = EXPENSE_PREFIX if file_type == 'expense' else STATEMENT_PREFIX
         s3_key = f"{prefix}{file.filename}"
 
-        success = upload_to_s3(file.read(), s3_key, content_type="application/pdf")
+        success = upload_to_s3(file.read(), S3_BUCKET, s3_key, content_type="application/pdf")
         if not success:
             return jsonify({"error": "Failed to upload to S3"}), 500
 
@@ -130,5 +151,47 @@ def health_check():
         print(traceback.format_exc())
         return jsonify({"success": False, "error": str(e)}), 500
 
+@app.route('/api/download-excel/<report_type>', methods=['GET'])
+def download_excel(report_type):
+    try:
+        # Map report types to S3 keys
+        s3_key_mapping = {
+            'savings': 'reconciliation/llm_reconciliation_output.xlsx',
+            'current': 'reconciliation/current_account.xlsx',
+            'invoice': 'reconciliation/llm_invoice_reconciliation.xlsx'
+        }
+        
+        if report_type not in s3_key_mapping:
+            return jsonify({"error": "Invalid report type"}), 400
+            
+        s3_key = s3_key_mapping[report_type]
+        
+        # Download file from S3
+        excel_bytes = download_s3_file(S3_BUCKET, s3_key)
+        if not excel_bytes:
+            return jsonify({"error": f"Excel file not found for {report_type} report"}), 404
+            
+        # Create BytesIO object
+        excel_buffer = BytesIO(excel_bytes)
+        excel_buffer.seek(0)
+        
+        # Determine filename
+        filename_mapping = {
+            'savings': 'savings_reconciliation_report.xlsx',
+            'current': 'current_account_reconciliation_report.xlsx', 
+            'invoice': 'invoice_reconciliation_report.xlsx'
+        }
+        
+        return send_file(
+            excel_buffer,
+            mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+            as_attachment=True,
+            download_name=filename_mapping[report_type]
+        )
+        
+    except Exception as e:
+        print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
 if __name__ == '__main__':
-    app.run( host='0.0.0.0', port=5000)
+    app.run(host='0.0.0.0', port=5000)

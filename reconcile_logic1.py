@@ -41,8 +41,7 @@ def parse_date(date_str: str) -> Optional[datetime.date]:
         print(f"❌ Date parsing failed for: {date_str} - {e}")
         return None
 
-def extract_expense_data(pdf_input: Union[str, bytes, bytearray]) -> List[Dict]:
-    """Enhanced expense data extraction with better error handling and field validation"""
+""" def extract_expense_data(pdf_input: Union[str, bytes, bytearray]) -> List[Dict]:
     if isinstance(pdf_input, (bytes, bytearray)):
         reader = PdfReader(BytesIO(pdf_input))
         file_name = "uploaded.pdf"
@@ -74,10 +73,8 @@ def extract_expense_data(pdf_input: Union[str, bytes, bytearray]) -> List[Dict]:
     for line in lines:
         if line == "PAGE_SEPARATOR":
             continue
-        date_match = (
-            re.match(r"\d{1,2}-[A-Za-z]{3}-\d{4}", line) or 
-            re.match(r"\d{1,2}/\d{1,2}/\d{4}", line)
-        )
+        date_match = re.match(r"\d{1,2}-[A-Za-z]{3}-\d{4}", line)
+
         if date_match:
             if all(current_entry.values()):
                 entries.append(current_entry.copy())
@@ -110,7 +107,6 @@ def extract_expense_data(pdf_input: Union[str, bytes, bytearray]) -> List[Dict]:
     return entries
 
 def extract_invoice_data(pdf_input: Union[str, bytes, bytearray]) -> List[Dict]:
-    """Enhanced invoice extraction with better pattern matching"""
     if isinstance(pdf_input, (bytes, bytearray)):
         reader = PdfReader(BytesIO(pdf_input))
         file_name = "uploaded.pdf"
@@ -170,7 +166,6 @@ def extract_invoice_data(pdf_input: Union[str, bytes, bytearray]) -> List[Dict]:
         }]
 
 def extract_statement_entries(pdf_input: Union[str, bytes, bytearray]) -> List[Dict]:
-    """Enhanced statement parsing with transaction type detection"""
     if isinstance(pdf_input, (bytes, bytearray)):
         reader = PdfReader(BytesIO(pdf_input))
         file_name = "uploaded.pdf"
@@ -244,7 +239,6 @@ def extract_statement_entries(pdf_input: Union[str, bytes, bytearray]) -> List[D
     return entries
 
 def extract_current_account_statement(pdf_input: Union[str, bytes, bytearray]) -> List[Dict]:
-    """Enhanced current account statement parser with better pattern matching"""
     if isinstance(pdf_input, (bytes, bytearray)):
         reader = PdfReader(BytesIO(pdf_input))
         file_name = "uploaded.pdf"
@@ -294,7 +288,7 @@ def extract_current_account_statement(pdf_input: Union[str, bytes, bytearray]) -
             "file": file_name,
             "reason": "No current account transactions found"
         }]
-    return entries
+    return entries """
 
 # === S3-based Extraction and LLM Reconciliation (Alternate/Preview Logic) ===
 
@@ -944,9 +938,7 @@ def reconcile_preview():
 
     # Get the metrics
     saving_metrics = calculate_savings_metrics(summary_savings)
-    current_metrics = calculate_current_metrics(summary_current)
-
-    # Upload summaries
+    current_metrics = calculate_current_metrics(summary_current)    # Upload summaries
     upload_to_s3(summary_savings.encode("utf-8"), S3_BUCKET, "reconciliation/saving_account_summary.txt", content_type="text/plain")
     upload_to_s3(summary_current.encode("utf-8"), S3_BUCKET, "reconciliation/current_account_summary.txt", content_type="text/plain")
 
@@ -959,7 +951,12 @@ def reconcile_preview():
         'all_expenses': all_expenses,
         'all_savings_statements': all_savings_statements,
         'saving_metrics': saving_metrics,
-        'current_metrics': current_metrics
+        'current_metrics': current_metrics,
+        'excel_files': {
+            'savings': 'reconciliation/llm_reconciliation_output.xlsx',
+            'current': 'reconciliation/current_account.xlsx',
+            'invoice': 'reconciliation/llm_invoice_reconciliation.xlsx'
+        }
     }
 
 def reconcile_with_llm(expenses: List[Dict], statements: List[Dict]):
@@ -1156,6 +1153,10 @@ Saving Account Entries:
     summary_lines.append(f"🔁 Total Duplicate Statement Entries: {len(duplicate_statements)}")
 
     summary_text = "\n".join(summary_lines)
+
+    # Print the savings summary
+    print("\n📊 === SAVINGS RECONCILIATION SUMMARY ===")
+    print(summary_text)
 
     # Write Excel output properly indented inside the function
     with pd.ExcelWriter("llm_reconciliation_output.xlsx") as writer:
