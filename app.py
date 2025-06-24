@@ -12,7 +12,7 @@ CORS(app)
 
 EXPENSE_PREFIX = "expenses/"
 STATEMENT_PREFIX = "statement/"
-PURCHASE_JSON_KEY = "purchases/email_processing_results.json"
+PURCHASE_JSON_KEY = "purchases/processed_jsons.json"
 S3_BUCKET = os.getenv("S3_BUCKET_NAME")
 
 @app.route('/api/reconcile', methods=['POST'])
@@ -81,10 +81,51 @@ def get_purchases():
 
         purchase_data = json.loads(json_bytes.decode('utf-8'))
 
+        # Support new structure: { "whatsapp": { ... }, "gmail": { ... } }
+        whatsapp_orders = []
+        whatsapp_summary = {}
+        gmail_orders = []
+        gmail_summary = {}
+        # WhatsApp
+        if "whatsapp" in purchase_data:
+            whatsapp_data = purchase_data["whatsapp"]
+            whatsapp_orders = whatsapp_data.get("purchase_orders", [])
+            whatsapp_summary = whatsapp_data.get("summary", {})
+        # Gmail
+        if "gmail" in purchase_data:
+            gmail_data = purchase_data["gmail"]
+            gmail_orders = gmail_data.get("purchase_orders", [])
+            gmail_summary = gmail_data.get("summary", {})
+        # Fallback for old structure
+        if not whatsapp_orders and not gmail_orders:
+            whatsapp_orders = purchase_data.get("purchase_orders", [])
+            whatsapp_summary = purchase_data.get("summary", {})
+
+        # Combine all purchases for 'all' option
+        all_orders = whatsapp_orders + gmail_orders
+        # Optionally, combine summaries if both exist (here, just return both in a dict)
+        all_summary = {}
+        if whatsapp_summary or gmail_summary:
+            all_summary = {"whatsapp": whatsapp_summary, "gmail": gmail_summary}
+        else:
+            all_summary = whatsapp_summary or gmail_summary or {}
+
         return jsonify({
             "success": True,
-            "purchases": purchase_data.get("purchase_orders", []),
-            "summary": purchase_data.get("summary", {})
+            "purchases": all_orders,  # Default: all purchases
+            "summary": all_summary,   # Default: all summary
+            "all": {
+                "purchases": all_orders,
+                "summary": all_summary
+            },
+            "whatsapp": {
+                "purchases": whatsapp_orders,
+                "summary": whatsapp_summary
+            },
+            "gmail": {
+                "purchases": gmail_orders,
+                "summary": gmail_summary
+            }
         })
     except Exception as e:
         import traceback
