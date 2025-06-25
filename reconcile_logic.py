@@ -589,7 +589,6 @@ def reconcile_invoices_with_llm(invoices: List[Dict], current_statements: List[D
     prompt = ChatPromptTemplate.from_messages([
         ("system", """
 You are a strict, detail-oriented financial assistant trained to reconcile merchant invoices with credit merchant settlement entries (from a current account).
-Always output strict JSON. No markdown, no explanations.
 
 ==========================
 🧠 CHAIN-OF-THOUGHT LOGIC:
@@ -604,10 +603,11 @@ Step 2️⃣: Identify and separate duplicates in both:
 
 Step 3️⃣: Match invoices to settlement entries:
 ✅ A match is valid only if:
-- Amount matches **exactly**
+- Amount matches **exactly** to the penny with no rounding
 - Invoice number (from invoice `description`) is **found as substring** (case-insensitive) in the settlement `description`
-- **Date must also match exactly** (no leeway)
-- One-to-one match only. Do not force match if one condition fails.
+- **Date must match EXACTLY** (yyyy-mm-dd format must be identical, with ZERO tolerance for date differences)
+- One-to-one match only. Do not force match if ANY condition fails.
+- If dates differ by even one day, consider it unmatched regardless of other matching criteria.
 
 Step 4️⃣: Identify unmatched invoices:
 - These are valid invoices not matched to any settlement and not considered duplicates.
@@ -644,11 +644,11 @@ Step 7️⃣: Return a final JSON result with all sections described below.
         ("user", """
 You are given two lists:
 1. `invoices`: system-generated invoice entries.
-2. `payments`: credit entries from the current account.
+2. `Current Account Statements:`: credit entries from the current account.
 
 Your task is to reconcile invoice payments using this logic:
 - ✅ Match if `amount` is the same and `description` semantically links invoice number or vendor.
-- 🗕️ Dates may differ by up to 3 days.
+- **Date must also match exactly** (no leeway)
 - 🔁 Detect and separate duplicates (same invoice repeated).
 - ❌ Do NOT count duplicates in `matched`.
 - 🟢 Statement entries with no corresponding invoice may be reimbursements.
@@ -671,7 +671,7 @@ Invoices:
 [
   {{ "date": "2025-06-20", "amount": 27033.29, "description": "Invoice INV-20250620-996A7766" }}
 ]
-Payments:
+Current Account Statements:
 [
   {{ "date": "2025-06-22", "amount": 27033.29, "description": "ACH Payment - Omkar Mestry", "type": "credit" }}
 ]"""),
