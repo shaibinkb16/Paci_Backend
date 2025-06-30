@@ -20,3 +20,4 @@ requests
 flask_cors      # corrected
 openpyxl
 json5
+PyPDF2

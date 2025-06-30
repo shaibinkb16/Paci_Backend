@@ -12,7 +12,7 @@ CORS(app)
 
 EXPENSE_PREFIX = "expenses/"
 STATEMENT_PREFIX = "statement/"
-PURCHASE_JSON_KEY = "purchases/email_processing_results.json"
+PURCHASE_JSON_KEY = "purchases/processed_jsons.json"
 S3_BUCKET = os.getenv("S3_BUCKET_NAME")
 
 @app.route('/api/reconcile', methods=['POST'])
@@ -81,22 +81,47 @@ def get_purchases():
 
         purchase_data = json.loads(json_bytes.decode('utf-8'))
 
-        # Only return gmail purchases and summary
+        # Support new structure: { "whatsapp": { ... }, "gmail": { ... } }
+        whatsapp_orders = []
+        whatsapp_summary = {}
         gmail_orders = []
         gmail_summary = {}
+        # WhatsApp
+        if "whatsapp" in purchase_data:
+            whatsapp_data = purchase_data["whatsapp"]
+            whatsapp_orders = whatsapp_data.get("purchase_orders", [])
+            whatsapp_summary = whatsapp_data.get("summary", {})
+        # Gmail
         if "gmail" in purchase_data:
             gmail_data = purchase_data["gmail"]
             gmail_orders = gmail_data.get("purchase_orders", [])
             gmail_summary = gmail_data.get("summary", {})
+        # Fallback for old structure
+        if not whatsapp_orders and not gmail_orders:
+            whatsapp_orders = purchase_data.get("purchase_orders", [])
+            whatsapp_summary = purchase_data.get("summary", {})
+
+        # Combine all purchases for 'all' option
+        all_orders = whatsapp_orders + gmail_orders
+        # Optionally, combine summaries if both exist (here, just return both in a dict)
+        all_summary = {}
+        if whatsapp_summary or gmail_summary:
+            all_summary = {"whatsapp": whatsapp_summary, "gmail": gmail_summary}
         else:
-            # Fallback for flat structure (if ever needed)
-            gmail_orders = purchase_data.get("purchase_orders", [])
-            gmail_summary = purchase_data.get("summary", {})
+            all_summary = whatsapp_summary or gmail_summary or {}
 
         return jsonify({
             "success": True,
-            "purchases": gmail_orders,  # Only gmail purchases
-            "summary": gmail_summary,   # Only gmail summary
+            "purchases": all_orders,  # Default: all purchases
+            "summary": all_summary,   # Default: all summary
+            "all": {
+                "purchases": all_orders,
+                "summary": all_summary
+            },
+            "whatsapp": {
+                "purchases": whatsapp_orders,
+                "summary": whatsapp_summary
+            },
             "gmail": {
                 "purchases": gmail_orders,
                 "summary": gmail_summary
@@ -107,7 +132,7 @@ def get_purchases():
         print(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 
-@app.route('/api/upload', methods=['POST'])
+""" @app.route('/api/upload', methods=['POST'])
 def upload_file():
     try:
         if 'file' not in request.files:
@@ -137,7 +162,7 @@ def upload_file():
         import traceback
         print(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
-
+ """
 @app.route('/api/health', methods=['GET'])
 def health_check():
     try:
@@ -206,6 +231,149 @@ def download_excel(report_type):
         )
         
     except Exception as e:
+        print(traceback.format_exc())
+        return jsonify({"error": str(e)}), 500
+
+@app.route('/api/profitloss', methods=['GET'])
+def get_profitloss():
+    try:
+        profitloss_bytes = download_s3_file(S3_BUCKET, "reconciliation/profitloss1.txt")
+        if not profitloss_bytes:
+            return jsonify({"error": "Profit & Loss data not found"}), 404
+            
+        profitloss_text = profitloss_bytes.decode("utf-8")
+        import re
+        
+        # Parse the text into structured data
+        data = {
+            "raw_text": profitloss_text,
+            "expense_items": [],
+            "return_items": [],
+            "total_expenses": 0.0,
+            "total_loss_from_returns": 0.0,
+            "revenue": 0.0,
+            "cogs": 0.0,
+            "gross_profit": 0.0,
+            "net_profit": 0.0,
+            "matched_invoice_ids": []
+        }
+        
+        # Extract expense items
+        if "Operating Expense Items (Validated):" in profitloss_text:
+            expense_section = profitloss_text.split("Operating Expense Items (Validated):")[1].split("🧮")[0]
+            expense_items_structured = []
+            
+            for line in expense_section.strip().split("\n"):
+                if line.strip().startswith("-"):
+                    item = line.strip()[2:].strip()
+                    data["expense_items"].append(item)
+                    
+                    # Improved regex pattern to match amounts in parentheses
+                    amount_match = re.search(r"\(\$([0-9,]+\.\d{2})\)", item)
+                    if amount_match:
+                        try:
+                            amount = float(amount_match.group(1).replace(",", ""))
+                            description = item.split("($")[0].strip()
+                            expense_items_structured.append({
+                                "description": description,
+                                "amount": amount
+                            })
+                        except ValueError:
+                            pass
+            
+            data["expense_items_structured"] = expense_items_structured
+        
+        # Extract return items
+        if "Returned / Refunded Items" in profitloss_text:
+            return_section = profitloss_text.split("Returned / Refunded Items")[1].split("💥")[0]
+            return_items_structured = []
+            
+            for line in return_section.strip().split("\n"):
+                if line.strip().startswith("-"):
+                    item = line.strip()[2:].strip()
+                    data["return_items"].append(item)
+                    
+                    # Improved regex pattern to match amounts in parentheses
+                    amount_match = re.search(r"\(\$([0-9,]+\.\d{2})\)", item)
+                    if amount_match:
+                        try:
+                            amount = float(amount_match.group(1).replace(",", ""))
+                            description = item.split("($")[0].strip()
+                            return_items_structured.append({
+                                "description": description,
+                                "amount": amount
+                            })
+                        except ValueError:
+                            pass
+            
+            data["return_items_structured"] = return_items_structured
+        
+        # Extract total expenses
+        total_expenses_match = re.search(r"Total Operating Expenses \(Excludes Returns\): \$([0-9,]+\.\d{2})", profitloss_text)
+        if total_expenses_match:
+            data["total_expenses"] = float(total_expenses_match.group(1).replace(",", ""))
+        
+        # Extract total loss from returns
+        total_loss_match = re.search(r"Total Loss from Returns: \$([0-9,]+\.\d{2})", profitloss_text)
+        if total_loss_match:
+            data["total_loss_from_returns"] = float(total_loss_match.group(1).replace(",", ""))
+            
+        # Extract PnL summary values
+        revenue_match = re.search(r"Revenue: \$([0-9,]+\.\d{2})", profitloss_text)
+        if revenue_match:
+            data["revenue"] = float(revenue_match.group(1).replace(",", ""))
+            
+        cogs_match = re.search(r"COGS \(70% of Revenue\): \$([0-9,]+\.\d{2})", profitloss_text)
+        if cogs_match:
+            data["cogs"] = float(cogs_match.group(1).replace(",", ""))
+            
+        gross_profit_match = re.search(r"Gross Profit: \$([0-9,]+\.\d{2})", profitloss_text)
+        if gross_profit_match:
+            data["gross_profit"] = float(gross_profit_match.group(1).replace(",", ""))
+            
+        net_profit_match = re.search(r"Net Profit: \$([\-0-9,]+\.\d{2})", profitloss_text)
+        if net_profit_match:
+            data["net_profit"] = float(net_profit_match.group(1).replace(",", ""))
+            
+        # Extract matched invoice IDs
+        if "Matched Invoice IDs:" in profitloss_text:
+            invoice_section = profitloss_text.split("Matched Invoice IDs:")[1].split("✅")[0]
+            for line in invoice_section.strip().split("\n"):
+                if line.strip().startswith("-"):
+                    inv_id = line.strip()[2:].strip()
+                    data["matched_invoice_ids"].append(inv_id)
+        
+        # Add data for charts
+        data["chart_data"] = {
+            "expense_breakdown": [
+                {"name": item["description"], "value": item["amount"]}
+                for item in data.get("expense_items_structured", [])
+            ],
+            "returns_breakdown": [
+                {"name": item["description"], "value": item["amount"]}
+                for item in data.get("return_items_structured", [])
+            ],
+            "profit_loss_summary": [
+                {"name": "Revenue", "value": data["revenue"]},
+                {"name": "COGS", "value": data["cogs"]},
+                {"name": "Gross Profit", "value": data["gross_profit"]},
+                {"name": "Operating Expenses", "value": data["total_expenses"]},
+                {"name": "Return Losses", "value": data["total_loss_from_returns"]},
+                {"name": "Net Profit", "value": data["net_profit"]}
+            ]
+        }
+        
+        # Debug: Print the expense data
+        print(f"Expense data: {data['expense_items_structured']}")
+        print(f"Chart data: {data['chart_data']['expense_breakdown']}")
+        
+        return jsonify({
+            "success": True,
+            "profitloss": data
+        })
+        
+    except Exception as e:
+        import traceback
         print(traceback.format_exc())
         return jsonify({"error": str(e)}), 500
 
